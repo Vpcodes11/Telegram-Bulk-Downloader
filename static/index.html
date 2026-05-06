@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Telegram Media Downloader</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <div class="bg-shape shape-1"></div>
+    <div class="bg-shape shape-2"></div>
+    
+    <div class="container">
+        <header>
+            <div class="logo-icon">
+                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                    <path d="M22 2L11 13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                    <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </div>
+            <h1>Telegram Downloader</h1>
+            <p>High-speed concurrent media extraction</p>
+        </header>
+
+        <main>
+            <!-- Step 1: Configuration -->
+            <section id="step-config" class="card active">
+                <h2>1. Configuration</h2>
+                <form id="config-form">
+                    <div class="input-group">
+                        <label for="api-id">API ID</label>
+                        <input type="number" id="api-id" required placeholder="e.g. 12345678">
+                    </div>
+                    <div class="input-group">
+                        <label for="api-hash">API Hash</label>
+                        <input type="text" id="api-hash" required placeholder="e.g. 3e50e577960343532691044a23567c89">
+                    </div>
+                    <div class="input-group">
+                        <label for="phone">Phone Number</label>
+                        <input type="text" id="phone" required placeholder="e.g. +1234567890">
+                    </div>
+                    <button type="submit" class="btn primary" id="btn-login">
+                        <span>Connect to Telegram</span>
+                        <div class="loader hidden" id="login-loader"></div>
+                    </button>
+                    <div class="error-msg" id="login-error"></div>
+                </form>
+            </section>
+
+            <!-- Step 2: Verification Code -->
+            <section id="step-code" class="card hidden">
+                <h2>2. Verification</h2>
+                <p class="subtitle">Please enter the code sent to your Telegram app.</p>
+                <form id="code-form">
+                    <div class="input-group">
+                        <label for="verification-code">Login Code</label>
+                        <input type="text" id="verification-code" required placeholder="Enter 5-digit code">
+                    </div>
+                    <div class="input-group hidden" id="password-group">
+                        <label for="2fa-password">2FA Password (if enabled)</label>
+                        <input type="password" id="2fa-password" placeholder="Enter password">
+                    </div>
+                    <button type="submit" class="btn primary" id="btn-verify">
+                        <span>Verify Code</span>
+                        <div class="loader hidden" id="verify-loader"></div>
+                    </button>
+                    <div class="error-msg" id="verify-error"></div>
+                </form>
+            </section>
+
+            <!-- Step 3: Download Control -->
+            <section id="step-download" class="card hidden">
+                <h2>3. Download Media</h2>
+                <div class="status-badge success">Connected</div>
+                <form id="download-form">
+                    <div class="input-group">
+                        <label for="chat-name">Target Chat / Channel</label>
+                        <input type="text" id="chat-name" required placeholder="e.g. @channelname or https://t.me/...">
+                    </div>
+                    <div class="input-group">
+                        <label for="concurrent">Concurrent Downloads (Speed)</label>
+                        <input type="range" id="concurrent" min="1" max="10" value="5" oninput="this.nextElementSibling.value = this.value">
+                        <output>5</output>
+                    </div>
+                    <button type="submit" class="btn primary" id="btn-start">
+                        <span>Start Downloading</span>
+                    </button>
+                    <div class="error-msg" id="download-error"></div>
+                </form>
+
+                <!-- Progress Area -->
+                <div id="progress-container" class="hidden">
+                    <div class="progress-status">
+                        <span id="status-text">Gathering messages...</span>
+                        <span id="status-count">0 / 0</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/script.js"></script>
+</body>
+</html>
