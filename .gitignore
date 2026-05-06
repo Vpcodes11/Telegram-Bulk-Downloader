@@ -4,6 +4,7 @@ __pycache__/
 *.session
 *.session-journal
 downloads/
+*.zip
 .env
 venv/
 env/

@@ -10,40 +10,44 @@
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <div class="bg-shape shape-1"></div>
-    <div class="bg-shape shape-2"></div>
+    <div class="bg-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+        <div class="blob blob-3"></div>
+    </div>
     
     <div class="container">
         <header>
-            <div class="logo-icon">
-                <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                    <path d="M22 2L11 13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                    <path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            <div class="logo-container">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                    <polyline points="7 10 12 15 17 10"/>
+                    <line x1="12" y1="15" x2="12" y2="3"/>
                 </svg>
             </div>
-            <h1>Telegram Downloader</h1>
-            <p>High-speed concurrent media extraction</p>
+            <h1>Telegram Pro</h1>
+            <p>Advanced Media Extraction Suite</p>
         </header>
 
         <main>
             <!-- Step 1: Configuration -->
             <section id="step-config" class="card active">
-                <h2>1. Configuration</h2>
+                <h2>Configuration</h2>
                 <form id="config-form">
                     <div class="input-group">
-                        <label for="api-id">API ID</label>
-                        <input type="number" id="api-id" required placeholder="e.g. 12345678">
+                        <label>API ID</label>
+                        <input type="number" id="api-id" required placeholder="12345678">
                     </div>
                     <div class="input-group">
-                        <label for="api-hash">API Hash</label>
-                        <input type="text" id="api-hash" required placeholder="e.g. 3e50e577960343532691044a23567c89">
+                        <label>API Hash</label>
+                        <input type="text" id="api-hash" required placeholder="3e50e577960343532691...">
                     </div>
                     <div class="input-group">
-                        <label for="phone">Phone Number</label>
-                        <input type="text" id="phone" required placeholder="e.g. +1234567890">
+                        <label>Phone Number</label>
+                        <input type="text" id="phone" required placeholder="+1234567890">
                     </div>
                     <button type="submit" class="btn primary" id="btn-login">
-                        <span>Connect to Telegram</span>
+                        <span>Initialize Session</span>
                         <div class="loader hidden" id="login-loader"></div>
                     </button>
                     <div class="error-msg" id="login-error"></div>
@@ -51,20 +55,20 @@
             </section>
 
             <!-- Step 2: Verification Code -->
-            <section id="step-code" class="card hidden">
-                <h2>2. Verification</h2>
-                <p class="subtitle">Please enter the code sent to your Telegram app.</p>
+            <section id="step-code" class="card">
+                <h2>Identity Verification</h2>
+                <p class="subtitle">Enter the 5-digit code sent to your device.</p>
                 <form id="code-form">
                     <div class="input-group">
-                        <label for="verification-code">Login Code</label>
-                        <input type="text" id="verification-code" required placeholder="Enter 5-digit code">
+                        <label>Login Code</label>
+                        <input type="text" id="verification-code" required placeholder="00000">
                     </div>
                     <div class="input-group hidden" id="password-group">
-                        <label for="2fa-password">2FA Password (if enabled)</label>
-                        <input type="password" id="2fa-password" placeholder="Enter password">
+                        <label>2FA Password</label>
+                        <input type="password" id="2fa-password" placeholder="••••••••">
                     </div>
                     <button type="submit" class="btn primary" id="btn-verify">
-                        <span>Verify Code</span>
+                        <span>Verify Identity</span>
                         <div class="loader hidden" id="verify-loader"></div>
                     </button>
                     <div class="error-msg" id="verify-error"></div>
@@ -72,32 +76,30 @@
             </section>
 
             <!-- Step 3: Download Control -->
-            <section id="step-download" class="card hidden">
-                <h2>3. Download Media</h2>
-                <div class="status-badge success">Connected</div>
+            <section id="step-download" class="card">
+                <div class="status-badge">Authenticated Session</div>
+                <h2>Media Extraction</h2>
                 <form id="download-form">
                     <div class="input-group">
-                        <label for="chat-name">Target Chat / Channel</label>
-                        <input type="text" id="chat-name" required placeholder="e.g. @channelname or https://t.me/...">
+                        <label>Target Channel or Chat</label>
+                        <input type="text" id="chat-name" required placeholder="@channelname or link">
                     </div>
                     <div class="input-group">
-                        <label for="concurrent">Concurrent Downloads (Speed)</label>
-                        <input type="range" id="concurrent" min="1" max="10" value="5" oninput="this.nextElementSibling.value = this.value">
-                        <output>5</output>
+                        <label>Download Threads <span class="range-val" id="thread-count">5</span></label>
+                        <input type="range" id="concurrent" min="1" max="15" value="5" oninput="document.getElementById('thread-count').innerText = this.value">
                     </div>
                     <button type="submit" class="btn primary" id="btn-start">
-                        <span>Start Downloading</span>
+                        <span>Start Extraction</span>
                     </button>
                     <div class="error-msg" id="download-error"></div>
                 </form>
 
-                <!-- Progress Area -->
                 <div id="progress-container" class="hidden">
-                    <div class="progress-status">
-                        <span id="status-text">Gathering messages...</span>
+                    <div class="progress-info">
+                        <span id="status-text">Processing...</span>
                         <span id="status-count">0 / 0</span>
                     </div>
-                    <div class="progress-bar">
+                    <div class="progress-bar-bg">
                         <div class="progress-fill" id="progress-fill"></div>
                     </div>
                 </div>

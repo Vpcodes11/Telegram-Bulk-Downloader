@@ -121,7 +121,7 @@ document.addEventListener('DOMContentLoaded', () => {
             
             // Start polling
             if (pollingInterval) clearInterval(pollingInterval);
-            pollingInterval = setInterval(pollStatus, 1000);
+            pollingInterval = setInterval(pollStatus, 800);
             
         } catch (err) {
             showError('download-error', err.message);
@@ -134,16 +134,20 @@ document.addEventListener('DOMContentLoaded', () => {
             const res = await fetch('/api/status');
             const data = await res.json();
             
-            document.getElementById('status-text').textContent = data.message;
-            document.getElementById('status-count').textContent = `${data.current} / ${data.total}`;
+            const statusText = document.getElementById('status-text');
+            const statusCount = document.getElementById('status-count');
+            const progressFill = document.getElementById('progress-fill');
+
+            statusText.textContent = data.message;
+            statusCount.textContent = `${data.current} / ${data.total}`;
             
             let percent = 0;
             if (data.total > 0) {
                 percent = (data.current / data.total) * 100;
             }
-            document.getElementById('progress-fill').style.width = `${percent}%`;
+            progressFill.style.width = `${percent}%`;
 
-            if (!data.running && data.message !== "Idle" && data.message !== "Gathering media messages...") {
+            if (!data.running && data.message !== "Idle" && !data.message.includes("Gathering")) {
                 clearInterval(pollingInterval);
                 document.getElementById('btn-start').disabled = false;
             }
