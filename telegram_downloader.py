@@ -50,14 +50,14 @@ async def get_media_type(message):
     else:
         return 'other'
 
-async def download_worker(name, queue, client, progress_bar):
+async def download_worker(name, queue, client, progress_bar, chat_dir):
     """Worker task to process downloads concurrently from the queue."""
     while True:
         try:
             message = await queue.get()
             
             media_type = await get_media_type(message)
-            type_dir = os.path.join(DOWNLOAD_DIR, media_type)
+            type_dir = os.path.join(chat_dir, media_type)
             os.makedirs(type_dir, exist_ok=True)
             
             filename = await get_file_name(message)
@@ -120,6 +120,13 @@ async def main():
     try:
         # Get the entity (user, chat, or channel)
         entity = await client.get_entity(CHAT_NAME)
+        # Create a folder based on the channel/chat name
+        chat_title = getattr(entity, 'title', getattr(entity, 'username', 'unknown_chat'))
+        # Clean the title for filesystem compatibility
+        chat_title = "".join([c for c in chat_title if c.isalnum() or c in ' ._-']).strip()
+        chat_dir = os.path.join(DOWNLOAD_DIR, chat_title)
+        os.makedirs(chat_dir, exist_ok=True)
+        
     except ValueError:
         logger.error(f"Could not find chat: {CHAT_NAME}. Make sure you are a member or it's public.")
         return
@@ -127,6 +134,7 @@ async def main():
         logger.error(f"Error getting entity: {e}")
         return
 
+    logger.info(f"Downloading to: {chat_dir}")
     logger.info("Gathering media messages. This might take a while for large channels...")
     messages_with_media = []
     
@@ -154,7 +162,7 @@ async def main():
     # Start concurrent workers
     workers = []
     for i in range(CONCURRENT_DOWNLOADS):
-        worker = asyncio.create_task(download_worker(f"worker-{i}", queue, client, progress_bar))
+        worker = asyncio.create_task(download_worker(f"worker-{i}", queue, client, progress_bar, chat_dir))
         workers.append(worker)
         
     # Wait for the queue to finish processing

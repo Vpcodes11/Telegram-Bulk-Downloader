@@ -92,13 +92,13 @@ async def get_media_type(message):
     elif message.gif: return 'gifs'
     else: return 'other'
 
-async def download_worker(queue):
+async def download_worker(queue, chat_dir):
     global client, download_status
     while True:
         try:
             message = await queue.get()
             media_type = await get_media_type(message)
-            type_dir = os.path.join(DOWNLOAD_DIR, media_type)
+            type_dir = os.path.join(chat_dir, media_type)
             os.makedirs(type_dir, exist_ok=True)
             
             filename = await get_file_name(message)
@@ -140,10 +140,16 @@ async def start_download(req: DownloadRequest):
     download_status["current"] = 0
     download_status["total"] = 0
     
-    asyncio.create_task(run_download_process(entity, req.concurrent_downloads))
+    # Create a folder based on the channel/chat name
+    chat_title = getattr(entity, 'title', getattr(entity, 'username', 'unknown_chat'))
+    chat_title = "".join([c for c in chat_title if c.isalnum() or c in ' ._-']).strip()
+    chat_dir = os.path.join(DOWNLOAD_DIR, chat_title)
+    os.makedirs(chat_dir, exist_ok=True)
+    
+    asyncio.create_task(run_download_process(entity, req.concurrent_downloads, chat_dir))
     return {"status": "started"}
 
-async def run_download_process(entity, concurrent_downloads):
+async def run_download_process(entity, concurrent_downloads, chat_dir):
     global client, download_status
     try:
         messages_with_media = []
@@ -153,7 +159,7 @@ async def run_download_process(entity, concurrent_downloads):
                 
         total_media = len(messages_with_media)
         download_status["total"] = total_media
-        download_status["message"] = f"Downloading {total_media} files..."
+        download_status["message"] = f"Downloading {total_media} files to {os.path.basename(chat_dir)}..."
         
         if total_media == 0:
             download_status["running"] = False
@@ -166,7 +172,7 @@ async def run_download_process(entity, concurrent_downloads):
             
         workers = []
         for i in range(concurrent_downloads):
-            worker = asyncio.create_task(download_worker(queue))
+            worker = asyncio.create_task(download_worker(queue, chat_dir))
             workers.append(worker)
             
         await queue.join()
