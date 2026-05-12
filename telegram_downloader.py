@@ -15,7 +15,7 @@ PHONE_NUMBER = '+919099662234'
 
 SESSION_NAME = 'media_downloader_session'
 DOWNLOAD_DIR = 'downloads'
-CONCURRENT_DOWNLOADS = 24 # Slightly lower for better stability
+CONCURRENT_DOWNLOADS = 12 # Lowered for stability during debug
 TIMEOUT_PER_FILE = 600
 # ==========================================
 
@@ -87,7 +87,8 @@ async def download_worker(worker_id, queue, client, chat_dir):
 
                 # Download
                 try:
-                    await client.download_media(message, file=unique_filepath)
+                    # Use a timeout to prevent hanging forever
+                    await asyncio.wait_for(client.download_media(message, file=unique_filepath), timeout=TIMEOUT_PER_FILE)
                     _bytes_downloaded += file_size
                 except FloodWaitError as e:
                     if flood_lock.is_set():
@@ -103,6 +104,10 @@ async def download_worker(worker_id, queue, client, chat_dir):
                     continue
                 except FileReferenceExpiredError:
                     message = await refresh_message(client, message)
+                    queue.put_nowait(message)
+                    continue
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout on {unique_filename} - re-queueing")
                     queue.put_nowait(message)
                     continue
                 except Exception as e:
@@ -121,6 +126,7 @@ async def producer(client, entity, queue):
     global terminal_progress
     count = 0
     try:
+        # Fetching in chunks of 100 for better feedback
         async for msg in client.iter_messages(entity):
             if msg.media:
                 queue.put_nowait(msg)
@@ -133,7 +139,7 @@ async def producer(client, entity, queue):
     return count
 
 async def main():
-    print("\n🚀 ULTRA-INSTANT TELEGRAM DOWNLOADER")
+    print("\n🚀 TELEGRAM DOWNLOADER (STABLE INSTANT START)")
     client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
     client.flood_sleep_threshold = 24 * 60 * 60
     await client.start(phone=PHONE_NUMBER)
@@ -153,7 +159,7 @@ async def main():
     
     queue = asyncio.Queue()
     global terminal_progress
-    terminal_progress = tqdm(total=0, desc="🚀 DOWNLOAD", unit="file", leave=True)
+    terminal_progress = tqdm(total=0, desc="🚀 PROGRESS", unit="file", leave=True)
     
     # Start workers
     workers = [asyncio.create_task(download_worker(i, queue, client, chat_dir)) for i in range(CONCURRENT_DOWNLOADS)]
@@ -172,15 +178,14 @@ async def main():
 
     speed_task = asyncio.create_task(monitor_speed())
     
-    # Start producer as a BACKGROUND task to allow immediate downloading
-    print("⏳ Streaming messages...")
+    # Start producer task
+    print("⏳ Streaming channel content...")
     producer_task = asyncio.create_task(producer(client, entity, queue))
     
-    # Wait for the producer to finish scanning
-    total_found = await producer_task
-    
-    # Wait for the queue to be fully processed
+    # Wait for completion
+    # We await the join first, then the producer task to get the final count
     await queue.join()
+    total_found = await producer_task
     
     # Cleanup
     for w in workers: w.cancel()
@@ -196,3 +201,5 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("\n🛑 Stopped.")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
