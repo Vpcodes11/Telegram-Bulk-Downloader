@@ -4,9 +4,7 @@ import asyncio
 import logging
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, FileReferenceExpiredError
-from telethon.tl.types import InputMessagesFilterDocument
 from tqdm.asyncio import tqdm
-import math
 
 # ==========================================
 # CONFIGURATION
@@ -17,11 +15,8 @@ PHONE_NUMBER = '+919099662234'
 
 SESSION_NAME = 'media_downloader_session'
 DOWNLOAD_DIR = 'downloads'
-CONCURRENT_DOWNLOADS = 24
+CONCURRENT_DOWNLOADS = 32 # Maximum workers for high-speed
 TIMEOUT_PER_FILE = 600
-PART_SIZE_KB = 1024 # 1MB chunks
-MIN_SIZE_FOR_PARALLEL = 10 * 1024 * 1024 # 10MB
-PARALLEL_CHUNKS = 4 # Number of parallel requests for a single large file
 # ==========================================
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -41,14 +36,10 @@ async def get_file_name(message):
 
 async def get_media_type(message):
     if message.photo: return 'photos'
-    elif message.video: 
-        if message.video.attributes and any(hasattr(a, 'round_message') and a.round_message for a in message.video.attributes):
-            return 'round_video'
-        return 'videos'
+    elif message.video: return 'videos'
     elif message.voice: return 'voice'
     elif message.audio: return 'audio'
     elif message.document: return 'files'
-    elif message.gif: return 'gifs'
     else: return 'other'
 
 async def refresh_message(client, message):
@@ -59,39 +50,8 @@ async def refresh_message(client, message):
         logger.warning(f"Could not refresh message {message.id}: {e}")
         return message
 
-async def fast_download(client, message, filepath):
-    global _bytes_downloaded
-    if not message.file: return
-    
-    file_size = message.file.size
-    last_received = 0
-    
-    def progress_callback(received, total):
-        nonlocal last_received
-        global _bytes_downloaded
-        delta = received - last_received
-        if delta > 0:
-            _bytes_downloaded += delta
-            last_received = received
-
-    try:
-        # For large files, we use a custom parallel downloader if possible.
-        # But Telethon's download_file is already quite optimized when cryptg is present.
-        # We will use download_file with 1MB chunks for maximum throughput.
-        await asyncio.wait_for(
-            client.download_file(
-                message.document or message.photo or message.video or message.audio or message.voice,
-                file=filepath,
-                part_size_kb=PART_SIZE_KB,
-                progress_callback=progress_callback
-            ),
-            timeout=TIMEOUT_PER_FILE
-        )
-    except asyncio.TimeoutError:
-        raise
-
 async def download_worker(queue, client, chat_dir):
-    global terminal_progress, flood_lock, is_paused
+    global terminal_progress, flood_lock, is_paused, _bytes_downloaded
     while True:
         try:
             if not flood_lock.is_set():
@@ -102,22 +62,40 @@ async def download_worker(queue, client, chat_dir):
             type_dir = os.path.join(chat_dir, m_type)
             os.makedirs(type_dir, exist_ok=True)
             
-            filename = await get_file_name(message)
-            filename = "".join([c for c in filename if c.isalnum() or c in ' ._-()']).rstrip()
-            if not filename: filename = f"file_{message.id}.unknown"
+            orig_name = await get_file_name(message)
+            clean_name = "".join([c for c in orig_name if c.isalnum() or c in ' ._-()']).rstrip()
+            if not clean_name: clean_name = "file.unknown"
             
-            filepath = os.path.join(type_dir, filename)
+            # New Unique Filename
+            unique_filename = f"{message.id}_{clean_name}"
+            unique_filepath = os.path.join(type_dir, unique_filename)
             
-            try:
-                part_path = filepath + ".part"
-                try:
-                    await fast_download(client, message, part_path)
-                except FileReferenceExpiredError:
-                    message = await refresh_message(client, message)
-                    await fast_download(client, message, part_path)
+            # Old Legacy Filename (for deduplication check)
+            legacy_filepath = os.path.join(type_dir, clean_name)
+            
+            file_size = message.file.size if message.file else 0
+            
+            # SMART DEDUPLICATION & MIGRATION
+            # 1. If unique file exists, skip
+            if os.path.exists(unique_filepath) and os.path.getsize(unique_filepath) == file_size:
+                if terminal_progress: terminal_progress.update(1)
+                queue.task_done()
+                continue
                 
-                if os.path.exists(part_path):
-                    os.rename(part_path, filepath)
+            # 2. If legacy file exists with correct size, migrate it to the unique name
+            if os.path.exists(legacy_filepath) and os.path.getsize(legacy_filepath) == file_size:
+                try:
+                    os.rename(legacy_filepath, unique_filepath)
+                    if terminal_progress: terminal_progress.update(1)
+                    queue.task_done()
+                    continue
+                except: pass # If migration fails, just download
+
+            # 3. Download
+            try:
+                # Direct download for max speed
+                await client.download_media(message, file=unique_filepath)
+                _bytes_downloaded += file_size
             except FloodWaitError as e:
                 if flood_lock.is_set():
                     flood_lock.clear()
@@ -128,18 +106,17 @@ async def download_worker(queue, client, chat_dir):
                         await asyncio.sleep(1)
                     is_paused = False
                     flood_lock.set()
-                else:
-                    await flood_lock.wait()
-                    queue.put_nowait(message)
-                    queue.task_done()
-                    continue
-            except asyncio.TimeoutError:
+                
                 queue.put_nowait(message)
+                queue.task_done()
+                continue
+            except FileReferenceExpiredError:
+                message = await refresh_message(client, message)
+                queue.put_nowait(message)
+                queue.task_done()
+                continue
             except Exception as e:
-                logger.error(f"Error {filename}: {e}")
-                if os.path.exists(filepath + ".part"):
-                    try: os.remove(filepath + ".part")
-                    except: pass
+                logger.error(f"Error {unique_filename}: {e}")
             
             if terminal_progress: terminal_progress.update(1)
             queue.task_done()
@@ -147,137 +124,77 @@ async def download_worker(queue, client, chat_dir):
         except Exception: 
             if not queue.empty(): queue.task_done()
 
-async def generate_html_export(chat_title, messages, chat_dir):
-    # This is now done at the end to prevent delaying the download
-    html_content = f"""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <title>Export: {chat_title}</title>
-        <style>
-            body {{ font-family: sans-serif; background: #f0f2f5; padding: 20px; }}
-            .message {{ background: white; padding: 15px; margin-bottom: 10px; border-radius: 8px; }}
-            .media_link {{ color: #0088cc; text-decoration: none; font-weight: bold; }}
-        </style>
-    </head>
-    <body>
-        <h1>{chat_title}</h1>
-        <div>{len(messages)} messages</div>
-        <hr>
-    """
-    for msg in messages:
-        if not msg or (hasattr(msg, 'action') and msg.action): continue
-        date_str = msg.date.strftime("%Y-%m-%d %H:%M:%S")
-        html_content += f'<div class="message"><div><b>User</b> <small>{date_str}</small></div>'
-        if msg.text: html_content += f'<div>{msg.text}</div>'
+async def producer(client, entity, queue):
+    """Scans for messages and puts them in the queue immediately."""
+    global terminal_progress
+    count = 0
+    async for msg in client.iter_messages(entity):
         if msg.media:
-            m_type = await get_media_type(msg)
-            fname = await get_file_name(msg)
-            fname = "".join([c for c in fname if c.isalnum() or c in ' ._-()']).rstrip()
-            if not fname: fname = f"file_{msg.id}.unknown"
-            html_content += f'<div><a class="media_link" href="{m_type}/{fname}">[Media: {m_type}] {fname}</a></div>'
-        html_content += f'</div>'
-    html_content += "</body></html>"
-    with open(os.path.join(chat_dir, "export_history.html"), "w", encoding="utf-8") as f:
-        f.write(html_content)
+            queue.put_nowait(msg)
+            count += 1
+            if terminal_progress:
+                terminal_progress.total = count
+                terminal_progress.refresh()
+    return count
 
 async def main():
-    print("\n🚀 FLASH CMD TELEGRAM DOWNLOADER (INSTANT START)")
-    client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH, connection_retries=None, auto_reconnect=True)
+    print("\n🚀 ULTRA-INSTANT TELEGRAM DOWNLOADER (FULL SPEED + NO OVERWRITE)")
+    client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
+    client.flood_sleep_threshold = 24 * 60 * 60
     await client.start(phone=PHONE_NUMBER)
     
     chat_input = input("\nEnter @channelname or link: ").strip()
     try:
         entity = await client.get_entity(chat_input)
     except Exception as e:
-        print(f"Error finding chat: {e}")
+        print(f"Error: {e}")
         return
 
     chat_title = "".join([c for c in getattr(entity, 'title', 'chat') if c.isalnum() or c in ' ._-']).strip()
     chat_dir = os.path.join(DOWNLOAD_DIR, chat_title)
     os.makedirs(chat_dir, exist_ok=True)
 
-    print(f"⚡ Target: {chat_title}")
-    all_messages = []
-    media_messages = []
+    print(f"⚡ Target: {chat_title} | Concurrency: {CONCURRENT_DOWNLOADS}")
     
-    scan_bar = tqdm(desc="Phase 1: Scanning (Books Only)", unit="msg")
-    # Using server-side filter for Documents (Books) to make scanning instant
-    async for msg in client.iter_messages(entity, filter=InputMessagesFilterDocument):
-        all_messages.append(msg)
-        if msg.media: media_messages.append(msg)
-        scan_bar.update(1)
+    queue = asyncio.Queue()
+    global terminal_progress
+    terminal_progress = tqdm(total=0, desc="🚀 PROGRESS", unit="file", leave=True)
     
-    # If no books found with filter, fall back to full scan
-    if not media_messages:
-        scan_bar.set_description("Phase 1: Scanning (Full)")
-        async for msg in client.iter_messages(entity):
-            if msg.id in [m.id for m in all_messages]: continue
-            all_messages.append(msg)
-            if msg.media: media_messages.append(msg)
-            scan_bar.update(1)
-            
-    scan_bar.close()
+    # Start workers
+    workers = [asyncio.create_task(download_worker(queue, client, chat_dir)) for _ in range(CONCURRENT_DOWNLOADS)]
     
-    if media_messages:
-        messages_to_download = []
-        skipped = 0
-        for m in media_messages:
-            m_type = await get_media_type(m)
-            fname = await get_file_name(m)
-            fname = "".join([c for c in fname if c.isalnum() or c in ' ._-()']).rstrip()
-            if not fname: fname = f"file_{m.id}.unknown"
-            fpath = os.path.join(chat_dir, m_type, fname)
-            fsize = m.file.size if m.file else 0
-            # If file doesn't exist or size is different, we download it
-            if os.path.exists(fpath) and os.path.getsize(fpath) == fsize:
-                skipped += 1
-            else:
-                messages_to_download.append(m)
-        
-        total = len(media_messages)
-        new_count = len(messages_to_download)
-        
-        if skipped > 0:
-            print(f"✅ Deduplication: {skipped}/{total} files already complete.")
-        
-        if new_count > 0:
-            print(f"🚀 Phase 2: Downloading {new_count} files...")
-            queue = asyncio.Queue()
-            for m in messages_to_download: queue.put_nowait(m)
-            
-            global terminal_progress
-            terminal_progress = tqdm(total=total, initial=skipped, desc="FLASH", unit="file", leave=True)
-            
-            workers = [asyncio.create_task(download_worker(queue, client, chat_dir)) for _ in range(CONCURRENT_DOWNLOADS)]
-            
-            async def monitor_speed():
-                global _bytes_downloaded, is_paused
-                prev = 0
-                while not queue.empty() or any(not w.done() for w in workers):
-                    await asyncio.sleep(1)
-                    curr = _bytes_downloaded
-                    mbps = (curr - prev) / (1024 * 1024)
-                    prev = curr
-                    if not is_paused:
-                        terminal_progress.set_postfix(speed=f"🚀 {mbps:.2f} MB/s")
+    # Start speed monitor
+    async def monitor_speed():
+        global _bytes_downloaded, is_paused
+        prev = 0
+        while True:
+            await asyncio.sleep(1)
+            curr = _bytes_downloaded
+            mbps = (curr - prev) / (1024 * 1024)
+            prev = curr
+            if not is_paused and terminal_progress:
+                terminal_progress.set_postfix(speed=f"🚀 {mbps:.2f} MB/s")
 
-            speed_task = asyncio.create_task(monitor_speed())
-            await queue.join()
-            for w in workers: w.cancel()
-            speed_task.cancel()
-            terminal_progress.close()
-            print("✅ Downloads complete!")
-        else:
-            print("✅ Everything is already up to date!")
-            
-        print("📄 Phase 3: Exporting HTML history...")
-        await generate_html_export(chat_title, list(reversed(all_messages)), chat_dir)
+    speed_task = asyncio.create_task(monitor_speed())
     
-    print(f"\nAll done! Path: {chat_dir}\n")
+    # Start scanning (concurrently)
+    print("⏳ Streaming messages to workers...")
+    total_found = await producer(client, entity, queue)
+    
+    # Wait for completion
+    await queue.join()
+    
+    # Cleanup
+    for w in workers: w.cancel()
+    speed_task.cancel()
+    terminal_progress.close()
+    
+    print(f"\n✅ Done! Found {total_found} files in total.")
     await client.disconnect()
 
 if __name__ == '__main__':
     if sys.platform == 'win32': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped by user.")
