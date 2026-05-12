@@ -15,7 +15,7 @@ PHONE_NUMBER = '+919099662234'
 
 SESSION_NAME = 'media_downloader_session'
 DOWNLOAD_DIR = 'downloads'
-CONCURRENT_DOWNLOADS = 32 # Maximum workers for high-speed
+CONCURRENT_DOWNLOADS = 24 # Slightly lower for better stability
 TIMEOUT_PER_FILE = 600
 # ==========================================
 
@@ -50,7 +50,7 @@ async def refresh_message(client, message):
         logger.warning(f"Could not refresh message {message.id}: {e}")
         return message
 
-async def download_worker(queue, client, chat_dir):
+async def download_worker(worker_id, queue, client, chat_dir):
     global terminal_progress, flood_lock, is_paused, _bytes_downloaded
     while True:
         try:
@@ -58,87 +58,82 @@ async def download_worker(queue, client, chat_dir):
                 await flood_lock.wait()
 
             message = await queue.get()
-            m_type = await get_media_type(message)
-            type_dir = os.path.join(chat_dir, m_type)
-            os.makedirs(type_dir, exist_ok=True)
-            
-            orig_name = await get_file_name(message)
-            clean_name = "".join([c for c in orig_name if c.isalnum() or c in ' ._-()']).rstrip()
-            if not clean_name: clean_name = "file.unknown"
-            
-            # New Unique Filename
-            unique_filename = f"{message.id}_{clean_name}"
-            unique_filepath = os.path.join(type_dir, unique_filename)
-            
-            # Old Legacy Filename (for deduplication check)
-            legacy_filepath = os.path.join(type_dir, clean_name)
-            
-            file_size = message.file.size if message.file else 0
-            
-            # SMART DEDUPLICATION & MIGRATION
-            # 1. If unique file exists, skip
-            if os.path.exists(unique_filepath) and os.path.getsize(unique_filepath) == file_size:
-                if terminal_progress: terminal_progress.update(1)
-                queue.task_done()
-                continue
-                
-            # 2. If legacy file exists with correct size, migrate it to the unique name
-            if os.path.exists(legacy_filepath) and os.path.getsize(legacy_filepath) == file_size:
-                try:
-                    os.rename(legacy_filepath, unique_filepath)
-                    if terminal_progress: terminal_progress.update(1)
-                    queue.task_done()
-                    continue
-                except: pass # If migration fails, just download
-
-            # 3. Download
             try:
-                # Direct download for max speed
-                await client.download_media(message, file=unique_filepath)
-                _bytes_downloaded += file_size
-            except FloodWaitError as e:
-                if flood_lock.is_set():
-                    flood_lock.clear()
-                    is_paused = True
-                    for remaining in range(e.seconds, 0, -1):
-                        if terminal_progress:
-                            terminal_progress.set_postfix(status=f"⏳ PAUSED {remaining}s")
-                        await asyncio.sleep(1)
-                    is_paused = False
-                    flood_lock.set()
+                m_type = await get_media_type(message)
+                type_dir = os.path.join(chat_dir, m_type)
+                os.makedirs(type_dir, exist_ok=True)
                 
-                queue.put_nowait(message)
+                orig_name = await get_file_name(message)
+                clean_name = "".join([c for c in orig_name if c.isalnum() or c in ' ._-()']).rstrip()
+                if not clean_name: clean_name = "file.unknown"
+                
+                unique_filename = f"{message.id}_{clean_name}"
+                unique_filepath = os.path.join(type_dir, unique_filename)
+                legacy_filepath = os.path.join(type_dir, clean_name)
+                
+                file_size = message.file.size if message.file else 0
+                
+                # Deduplication & Migration
+                if os.path.exists(unique_filepath) and os.path.getsize(unique_filepath) == file_size:
+                    if terminal_progress: terminal_progress.update(1)
+                    continue
+                    
+                if os.path.exists(legacy_filepath) and os.path.getsize(legacy_filepath) == file_size:
+                    try:
+                        os.rename(legacy_filepath, unique_filepath)
+                        if terminal_progress: terminal_progress.update(1)
+                        continue
+                    except: pass
+
+                # Download
+                try:
+                    await client.download_media(message, file=unique_filepath)
+                    _bytes_downloaded += file_size
+                except FloodWaitError as e:
+                    if flood_lock.is_set():
+                        flood_lock.clear()
+                        is_paused = True
+                        for remaining in range(e.seconds, 0, -1):
+                            if terminal_progress:
+                                terminal_progress.set_postfix(status=f"⏳ PAUSED {remaining}s")
+                            await asyncio.sleep(1)
+                        is_paused = False
+                        flood_lock.set()
+                    queue.put_nowait(message)
+                    continue
+                except FileReferenceExpiredError:
+                    message = await refresh_message(client, message)
+                    queue.put_nowait(message)
+                    continue
+                except Exception as e:
+                    logger.error(f"Error {unique_filename}: {e}")
+                
+                if terminal_progress: terminal_progress.update(1)
+            finally:
                 queue.task_done()
-                continue
-            except FileReferenceExpiredError:
-                message = await refresh_message(client, message)
-                queue.put_nowait(message)
-                queue.task_done()
-                continue
-            except Exception as e:
-                logger.error(f"Error {unique_filename}: {e}")
-            
-            if terminal_progress: terminal_progress.update(1)
-            queue.task_done()
         except asyncio.CancelledError: break
-        except Exception: 
+        except Exception as e:
+            logger.error(f"Worker {worker_id} crash: {e}")
             if not queue.empty(): queue.task_done()
 
 async def producer(client, entity, queue):
-    """Scans for messages and puts them in the queue immediately."""
+    """Scans for messages and puts them in the queue."""
     global terminal_progress
     count = 0
-    async for msg in client.iter_messages(entity):
-        if msg.media:
-            queue.put_nowait(msg)
-            count += 1
-            if terminal_progress:
-                terminal_progress.total = count
-                terminal_progress.refresh()
+    try:
+        async for msg in client.iter_messages(entity):
+            if msg.media:
+                queue.put_nowait(msg)
+                count += 1
+                if terminal_progress:
+                    terminal_progress.total = count
+                    terminal_progress.refresh()
+    except Exception as e:
+        logger.error(f"Producer error: {e}")
     return count
 
 async def main():
-    print("\n🚀 ULTRA-INSTANT TELEGRAM DOWNLOADER (FULL SPEED + NO OVERWRITE)")
+    print("\n🚀 ULTRA-INSTANT TELEGRAM DOWNLOADER")
     client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
     client.flood_sleep_threshold = 24 * 60 * 60
     await client.start(phone=PHONE_NUMBER)
@@ -154,14 +149,14 @@ async def main():
     chat_dir = os.path.join(DOWNLOAD_DIR, chat_title)
     os.makedirs(chat_dir, exist_ok=True)
 
-    print(f"⚡ Target: {chat_title} | Concurrency: {CONCURRENT_DOWNLOADS}")
+    print(f"⚡ Target: {chat_title}")
     
     queue = asyncio.Queue()
     global terminal_progress
-    terminal_progress = tqdm(total=0, desc="🚀 PROGRESS", unit="file", leave=True)
+    terminal_progress = tqdm(total=0, desc="🚀 DOWNLOAD", unit="file", leave=True)
     
     # Start workers
-    workers = [asyncio.create_task(download_worker(queue, client, chat_dir)) for _ in range(CONCURRENT_DOWNLOADS)]
+    workers = [asyncio.create_task(download_worker(i, queue, client, chat_dir)) for i in range(CONCURRENT_DOWNLOADS)]
     
     # Start speed monitor
     async def monitor_speed():
@@ -177,11 +172,14 @@ async def main():
 
     speed_task = asyncio.create_task(monitor_speed())
     
-    # Start scanning (concurrently)
-    print("⏳ Streaming messages to workers...")
-    total_found = await producer(client, entity, queue)
+    # Start producer as a BACKGROUND task to allow immediate downloading
+    print("⏳ Streaming messages...")
+    producer_task = asyncio.create_task(producer(client, entity, queue))
     
-    # Wait for completion
+    # Wait for the producer to finish scanning
+    total_found = await producer_task
+    
+    # Wait for the queue to be fully processed
     await queue.join()
     
     # Cleanup
@@ -189,7 +187,7 @@ async def main():
     speed_task.cancel()
     terminal_progress.close()
     
-    print(f"\n✅ Done! Found {total_found} files in total.")
+    print(f"\n✅ All done! {total_found} files processed.")
     await client.disconnect()
 
 if __name__ == '__main__':
@@ -197,4 +195,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n🛑 Stopped by user.")
+        print("\n🛑 Stopped.")
