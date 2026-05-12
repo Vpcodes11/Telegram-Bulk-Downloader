@@ -5,6 +5,7 @@ import logging
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, FileReferenceExpiredError
 from telethon.tl.types import InputMessagesFilterDocument
+from telethon.sessions import StringSession
 from tqdm.asyncio import tqdm
 import math
 
@@ -19,7 +20,7 @@ SESSION_NAME = 'media_downloader_session'
 DOWNLOAD_DIR = 'downloads'
 CONCURRENT_DOWNLOADS = 24
 TIMEOUT_PER_FILE = 600
-PART_SIZE_KB = 1024 # 1MB chunks
+PART_SIZE_KB = 512 # 512KB chunks
 MIN_SIZE_FOR_PARALLEL = 10 * 1024 * 1024 # 10MB
 PARALLEL_CHUNKS = 4 # Number of parallel requests for a single large file
 # ==========================================
@@ -250,7 +251,16 @@ async def main():
             global terminal_progress
             terminal_progress = tqdm(total=total, initial=skipped, desc="FLASH", unit="file", leave=True)
             
-            workers = [asyncio.create_task(download_worker(queue, client, chat_dir)) for _ in range(CONCURRENT_DOWNLOADS)]
+            from telethon.sessions import StringSession
+            session_str = StringSession.save(client.session)
+
+            worker_clients = []
+            for i in range(CONCURRENT_DOWNLOADS):
+                worker_client = TelegramClient(StringSession(session_str), int(API_ID), API_HASH)
+                await worker_client.connect()
+                worker_clients.append(worker_client)
+
+            workers = [asyncio.create_task(download_worker(queue, worker_clients[i], chat_dir)) for i in range(CONCURRENT_DOWNLOADS)]
             
             async def monitor_speed():
                 global _bytes_downloaded, is_paused
@@ -267,6 +277,7 @@ async def main():
             await queue.join()
             for w in workers: w.cancel()
             speed_task.cancel()
+            for wc in worker_clients: await wc.disconnect()
             terminal_progress.close()
             print("✅ Downloads complete!")
         else:

@@ -8,6 +8,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, FileReferenceExpiredError
+from telethon.sessions import StringSession
 from tqdm.asyncio import tqdm
 import uvicorn
 
@@ -185,7 +186,7 @@ async def refresh_message(message):
         return message
 
 async def fast_download(client, message, filepath):
-    """Highly optimized downloader using maximum 2MB chunks."""
+    """Highly optimized downloader using maximum 512KB chunks."""
     global _bytes_downloaded_total
     # For very small files, use standard download (no overhead)
     if not message.file or message.file.size < 512 * 1024:
@@ -194,19 +195,19 @@ async def fast_download(client, message, filepath):
             _bytes_downloaded_total += message.file.size if message.file else 0
         return
 
-    # Use low-level download_file with 2048KB (2MB) chunks — Telethon's usable max.
+    # Use low-level download_file with 512KB chunks — Telethon's usable max.
     # Larger chunks = fewer round-trips = dramatically faster on fast connections.
     await client.download_file(
         message.document or message.photo or message.video or message.audio or message.voice,
         file=filepath,
-        part_size_kb=2048
+        part_size_kb=512
     )
     async with _bytes_lock:
         _bytes_downloaded_total += message.file.size if message.file else 0
 
-async def download_worker(queue, chat_dir):
+async def download_worker(queue, chat_dir, worker_client):
     """High-speed download worker — handles global flood-wait pauses."""
-    global client, download_status, terminal_progress, flood_lock
+    global download_status, terminal_progress, flood_lock
     from telethon.errors import FloodWaitError
     while True:
         try:
@@ -230,11 +231,11 @@ async def download_worker(queue, chat_dir):
             try:
                 part_path = filepath + ".part"
                 try:
-                    await fast_download(client, message, part_path)
+                    await fast_download(worker_client, message, part_path)
                 except FileReferenceExpiredError:
                     logger.warning(f"File reference expired for {filename} — re-fetching...")
                     message = await refresh_message(message)
-                    await fast_download(client, message, part_path)
+                    await fast_download(worker_client, message, part_path)
                 
                 if os.path.exists(part_path):
                     os.rename(part_path, filepath)
@@ -487,10 +488,20 @@ async def run_download_process(entity, concurrent_downloads, chat_dir, selected_
                 # Start live speed tracker
                 speed_task = asyncio.create_task(_speed_tracker())
 
+                # Prepare worker clients using the main session
+                from telethon.sessions import StringSession
+                session_str = StringSession.save(client.session)
+
+                worker_clients = []
+                for i in range(concurrent_downloads):
+                    worker_client = TelegramClient(StringSession(session_str), client.api_id, client.api_hash)
+                    await worker_client.connect()
+                    worker_clients.append(worker_client)
+
                 # Phase 3: Unleash all workers simultaneously
                 workers = [
-                    asyncio.create_task(download_worker(queue, chat_dir))
-                    for _ in range(concurrent_downloads)
+                    asyncio.create_task(download_worker(queue, chat_dir, worker_clients[i]))
+                    for i in range(concurrent_downloads)
                 ]
 
                 await queue.join()
@@ -498,6 +509,8 @@ async def run_download_process(entity, concurrent_downloads, chat_dir, selected_
                 speed_task.cancel()
                 for w in workers:
                     w.cancel()
+                for wc in worker_clients:
+                    await wc.disconnect()
 
                 terminal_progress.close()
                 terminal_progress = None
