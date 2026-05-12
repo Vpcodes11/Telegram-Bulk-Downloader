@@ -51,6 +51,8 @@ async def refresh_message(client, message):
 
 async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
     global flood_lock, is_paused, _bytes_downloaded
+    retries = {}  # Track retry counts per message ID
+    MAX_RETRIES = 3
     while True:
         try:
             # If queue is empty and producer is still running, wait a bit
@@ -113,13 +115,25 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                     queue.put_nowait(message)
                     continue
                 except FileReferenceExpiredError:
-                    message = await refresh_message(client, message)
-                    queue.put_nowait(message)
-                    continue
+                    rid = message.id
+                    retries[rid] = retries.get(rid, 0) + 1
+                    if retries[rid] <= MAX_RETRIES:
+                        message = await refresh_message(client, message)
+                        queue.put_nowait(message)
+                        continue
+                    else:
+                        logger.warning(f"Skipping {unique_filename} after {MAX_RETRIES} retries (expired ref)")
+                        pbar.update(1)
                 except asyncio.TimeoutError:
-                    logger.warning(f"Timeout: {unique_filename}")
-                    queue.put_nowait(message)
-                    continue
+                    rid = message.id
+                    retries[rid] = retries.get(rid, 0) + 1
+                    if retries[rid] <= MAX_RETRIES:
+                        logger.warning(f"Timeout: {unique_filename} (retry {retries[rid]}/{MAX_RETRIES})")
+                        queue.put_nowait(message)
+                        continue
+                    else:
+                        logger.warning(f"Skipping {unique_filename} after {MAX_RETRIES} timeouts")
+                        pbar.update(1)
                 except Exception as e:
                     logger.error(f"Error {unique_filename}: {e}")
 
