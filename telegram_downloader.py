@@ -17,8 +17,7 @@ PHONE_NUMBER = '+919099662234'
 SESSION_NAME = 'media_downloader_session'
 DOWNLOAD_DIR = 'downloads'
 CONCURRENT_DOWNLOADS = 16
-TIMEOUT_PER_FILE = 300  # 5 min per file
-MAX_RETRIES = 3
+MAX_RETRIES = 2
 # ==========================================
 
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,6 +27,12 @@ flood_lock = asyncio.Event()
 flood_lock.set()
 _bytes_downloaded = 0
 is_paused = False
+
+def get_timeout(file_size):
+    """Dynamic timeout: 60s base + 30s per 10MB. Minimum 60s, Maximum 1800s."""
+    if not file_size: return 120
+    extra = (file_size / (10 * 1024 * 1024)) * 30
+    return min(max(60, 60 + extra), 1800)
 
 async def get_file_name(message):
     if message.file and hasattr(message.file, 'name') and message.file.name:
@@ -48,32 +53,20 @@ async def refresh_message(client, message):
         fresh = await client.get_messages(message.chat_id, ids=message.id)
         return fresh if fresh else message
     except Exception as e:
-        logger.warning(f"Could not refresh message {message.id}: {e}")
+        logger.warning(f"Could not refresh msg {message.id}: {e}")
         return message
 
 def interleave_by_size(messages):
-    """Sort messages so large and small files alternate.
-    This keeps all workers busy throughout the entire download,
-    preventing the 'slow tail' problem where only large files remain."""
-    
-    sized = []
-    for m in messages:
-        sz = m.file.size if m.file else 0
-        sized.append((sz, m))
-    
-    sized.sort(key=lambda x: x[0])  # small first
-    
-    # Split into two halves: small and large
+    """Interleave large and small files so workers stay busy throughout."""
+    sized = [(m.file.size if m.file else 0, m) for m in messages]
+    sized.sort(key=lambda x: x[0])
     half = len(sized) // 2
     small = [m for _, m in sized[:half]]
     large = [m for _, m in sized[half:]]
-    
-    # Interleave: small, large, small, large...
     result = []
     for i in range(max(len(small), len(large))):
         if i < len(small): result.append(small[i])
         if i < len(large): result.append(large[i])
-    
     return result
 
 async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
@@ -106,6 +99,7 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                 legacy_filepath = os.path.join(type_dir, clean_name)
 
                 file_size = message.file.size if message.file else 0
+                timeout = get_timeout(file_size)
 
                 # Deduplication & Migration
                 if os.path.exists(unique_filepath) and os.path.getsize(unique_filepath) == file_size:
@@ -119,37 +113,13 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                         continue
                     except: pass
 
-                # Download with progress tracking
-                last_received = 0
-                def make_progress_cb():
-                    nonlocal last_received
-                    def cb(received, total):
-                        nonlocal last_received
-                        global _bytes_downloaded
-                        delta = received - last_received
-                        if delta > 0:
-                            _bytes_downloaded += delta
-                            last_received = delta + last_received
-                    return cb
-
+                # Download using download_media (most reliable)
                 try:
-                    media_input = message.document or message.photo or message.video or message.audio or message.voice
-                    if media_input:
-                        await asyncio.wait_for(
-                            client.download_file(
-                                media_input,
-                                file=unique_filepath,
-                                part_size_kb=512,
-                                progress_callback=make_progress_cb()
-                            ),
-                            timeout=TIMEOUT_PER_FILE
-                        )
-                    else:
-                        await asyncio.wait_for(
-                            client.download_media(message, file=unique_filepath),
-                            timeout=TIMEOUT_PER_FILE
-                        )
-                        _bytes_downloaded += file_size
+                    await asyncio.wait_for(
+                        client.download_media(message, file=unique_filepath),
+                        timeout=timeout
+                    )
+                    _bytes_downloaded += file_size
                 except FloodWaitError as e:
                     if flood_lock.is_set():
                         flood_lock.clear()
@@ -169,24 +139,31 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                         queue.put_nowait(message)
                         continue
                     else:
-                        logger.warning(f"Skipping {unique_filename} after {MAX_RETRIES} retries")
+                        logger.warning(f"Skipped (expired): {unique_filename}")
                         pbar.update(1)
                 except asyncio.TimeoutError:
                     rid = message.id
                     retries[rid] = retries.get(rid, 0) + 1
                     if retries[rid] <= MAX_RETRIES:
-                        logger.warning(f"Timeout: {unique_filename} (retry {retries[rid]}/{MAX_RETRIES})")
+                        logger.warning(f"Timeout ({int(timeout)}s): {unique_filename} retry {retries[rid]}/{MAX_RETRIES}")
+                        # Clean up partial file
+                        if os.path.exists(unique_filepath):
+                            try: os.remove(unique_filepath)
+                            except: pass
                         queue.put_nowait(message)
                         continue
                     else:
-                        logger.warning(f"Skipping {unique_filename} after {MAX_RETRIES} timeouts")
+                        logger.warning(f"Skipped (timeout): {unique_filename}")
+                        if os.path.exists(unique_filepath):
+                            try: os.remove(unique_filepath)
+                            except: pass
                         pbar.update(1)
                 except Exception as e:
                     logger.error(f"Error {unique_filename}: {e}")
 
                 pbar.update(1)
             except Exception as e:
-                logger.error(f"Worker {worker_id} file error: {e}")
+                logger.error(f"Worker {worker_id} error: {e}")
         except asyncio.CancelledError:
             break
         except Exception as e:
@@ -194,12 +171,12 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
 
 async def main():
     global _bytes_downloaded
-    
+
     print("\n" + "="*50)
-    print("  TELEGRAM TURBO DOWNLOADER v3")
-    print("  Consistent Speed Edition")
+    print("  TELEGRAM TURBO DOWNLOADER v4")
+    print("  Consistent Speed + Smart Timeout")
     print("="*50)
-    
+
     client = TelegramClient(SESSION_NAME, int(API_ID), API_HASH)
     client.flood_sleep_threshold = 24 * 60 * 60
     await client.start(phone=PHONE_NUMBER)
@@ -216,7 +193,7 @@ async def main():
     os.makedirs(chat_dir, exist_ok=True)
 
     print(f"\nTarget: {chat_title}")
-    
+
     # ── PHASE 1: SCAN ──
     print("Phase 1: Scanning channel...")
     media_messages = []
@@ -227,31 +204,30 @@ async def main():
             media_messages.append(msg)
         if msg_count % 500 == 0:
             print(f"  Scanned {msg_count} messages, found {len(media_messages)} media...")
-    
+
     total_media = len(media_messages)
     print(f"  Scan complete: {msg_count} messages, {total_media} media files.\n")
-    
+
     if total_media == 0:
         print("No media found.")
         await client.disconnect()
         return
 
-    # ── PHASE 2: INTERLEAVE & DOWNLOAD ──
-    print("Phase 2: Optimizing download order (interleaving by size)...")
+    # ── PHASE 2: INTERLEAVE ──
     media_messages = interleave_by_size(media_messages)
-    
+
     queue = asyncio.Queue()
     done_event = asyncio.Event()
-    
+
     for m in media_messages:
         queue.put_nowait(m)
-    
+
     done_event.set()
-    
-    print(f"Phase 3: Downloading {total_media} files with {CONCURRENT_DOWNLOADS} workers...\n")
-    
+
+    print(f"Phase 2: Downloading {total_media} files with {CONCURRENT_DOWNLOADS} workers...\n")
+
     pbar = tqdm(total=total_media, desc="DOWNLOADING", unit="file", leave=True)
-    
+
     workers = [
         asyncio.create_task(download_worker(i, queue, client, chat_dir, pbar, done_event))
         for i in range(CONCURRENT_DOWNLOADS)
@@ -276,8 +252,9 @@ async def main():
     speed_task.cancel()
     pbar.close()
 
-    print(f"\nAll done! {total_media} files processed.")
-    print(f"Saved to: {os.path.abspath(chat_dir)}")
+    # Count actual files
+    actual_files = sum(len(files) for _, _, files in os.walk(chat_dir))
+    print(f"\nAll done! {actual_files} files in {os.path.abspath(chat_dir)}")
     await client.disconnect()
 
 if __name__ == '__main__':
