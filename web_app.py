@@ -323,13 +323,17 @@ async def start_download(req: DownloadRequest):
     asyncio.create_task(run_download_process(entity, req.concurrent_downloads, chat_dir, req.message_ids))
     return {"status": "started"}
 
+import html
+
 async def generate_html_export(chat_title, messages, chat_dir):
-    html_content = f"""
+    escaped_chat_title = html.escape(chat_title)
+    html_parts = []
+    html_parts.append(f"""
     <!DOCTYPE html>
     <html>
     <head>
         <meta charset="utf-8">
-        <title>Exported Chat: {chat_title}</title>
+        <title>Exported Chat: {escaped_chat_title}</title>
         <style>
             body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #e7ebf0; margin: 0; padding: 20px; }}
             .page_wrap {{ max-width: 800px; margin: 0 auto; background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); overflow: hidden; }}
@@ -350,18 +354,19 @@ async def generate_html_export(chat_title, messages, chat_dir):
     <body>
         <div class="page_wrap">
             <div class="header">
-                <h1>{chat_title}</h1>
+                <h1>{escaped_chat_title}</h1>
                 <div class="status">{len(messages)} messages</div>
             </div>
             <div class="history">
-    """
+    """)
     
     for msg in messages:
         if not msg: continue
         
         # Check if it's a service message
         if hasattr(msg, 'action') and msg.action:
-            html_content += f'<div class="service">{str(msg.action)}</div>'
+            escaped_action = html.escape(str(msg.action))
+            html_parts.append(f'<div class="service">{escaped_action}</div>')
             continue
             
         from_name = "User"
@@ -372,34 +377,39 @@ async def generate_html_export(chat_title, messages, chat_dir):
             if not from_name:
                 from_name = getattr(msg.sender, 'username', '') or 'User'
         
+        escaped_from_name = html.escape(from_name)
         date_str = msg.date.strftime("%Y-%m-%d %H:%M:%S")
         
-        html_content += f'<div class="message in">'
-        html_content += f'<div class="from_name">{from_name}</div>'
-        html_content += f'<div class="text">'
+        html_parts.append('<div class="message in">')
+        html_parts.append(f'<div class="from_name">{escaped_from_name}</div>')
+        html_parts.append('<div class="text">')
         
         if msg.text:
-            html_content += f'<div>{msg.text}</div>'
+            escaped_text = html.escape(msg.text)
+            html_parts.append(f'<div>{escaped_text}</div>')
             
         if msg.media:
             export_path = getattr(msg, '_export_path', None)
             if export_path:
                 media_type = await get_media_type(msg)
                 if media_type == 'photos':
-                    html_content += f'<div class="media"><a href="{export_path}"><img src="{export_path}"></a></div>'
+                    html_parts.append(f'<div class="media"><a href="{export_path}"><img src="{export_path}"></a></div>')
                 else:
                     filename = os.path.basename(export_path)
-                    html_content += f'<div class="media"><a class="media_link" href="{export_path}">📎 {filename} ({media_type})</a></div>'
+                    escaped_filename = html.escape(filename)
+                    html_parts.append(f'<div class="media"><a class="media_link" href="{export_path}">📎 {escaped_filename} ({media_type})</a></div>')
                     
-        html_content += f'<div class="pull_right">{date_str}</div>'
-        html_content += f'</div></div>'
+        html_parts.append(f'<div class="pull_right">{date_str}</div>')
+        html_parts.append('</div></div>')
         
-    html_content += """
+    html_parts.append("""
             </div>
         </div>
     </body>
     </html>
-    """
+    """)
+
+    html_content = "".join(html_parts)
     
     with open(os.path.join(chat_dir, "export_history.html"), "w", encoding="utf-8") as f:
         f.write(html_content)
