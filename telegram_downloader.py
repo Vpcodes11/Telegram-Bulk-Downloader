@@ -126,13 +126,15 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                             last_received = delta + last_received
                     return cb
 
+                part_filepath = unique_filepath + '.part'
+                
                 try:
                     media_input = getattr(message, 'document', None) or getattr(message, 'photo', None) or getattr(message, 'video', None) or getattr(message, 'audio', None) or getattr(message, 'voice', None)
                     if media_input:
                         await asyncio.wait_for(
                             client.download_file(
                                 media_input,
-                                file=unique_filepath,
+                                file=part_filepath,
                                 part_size_kb=512,
                                 progress_callback=make_progress_cb()
                             ),
@@ -142,11 +144,19 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                         await asyncio.wait_for(
                             client.download_media(
                                 message, 
-                                file=unique_filepath,
+                                file=part_filepath,
                                 progress_callback=make_progress_cb()
                             ),
                             timeout=timeout
                         )
+                    
+                    # Success! Rename to final file to prevent 0-byte ghost files
+                    if os.path.exists(part_filepath):
+                        if os.path.exists(unique_filepath):
+                            try: os.remove(unique_filepath)
+                            except: pass
+                        os.rename(part_filepath, unique_filepath)
+                        
                 except FloodWaitError as e:
                     if flood_lock.is_set():
                         flood_lock.clear()
@@ -187,7 +197,15 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                         pbar.update(1)
                 except Exception as e:
                     logger.error(f"Error {unique_filename}: {e}")
-
+                    if "disconnected" in str(e).lower():
+                        if not client.is_connected():
+                            logger.warning("Client disconnected. Reconnecting...")
+                            try: await client.connect()
+                            except: pass
+                    if os.path.exists(part_filepath):
+                        try: os.remove(part_filepath)
+                        except: pass
+                
                 pbar.update(1)
             except Exception as e:
                 logger.error(f"Worker {worker_id} error: {e}")
