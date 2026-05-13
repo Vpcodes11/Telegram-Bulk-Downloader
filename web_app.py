@@ -7,6 +7,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FileReferenceExpiredError
 from tqdm.asyncio import tqdm
 import uvicorn
@@ -21,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 # Global state
 client = None
+global_api_id = None
+global_api_hash = None
 SESSION_NAME = 'media_downloader_session'
 DOWNLOAD_DIR = 'downloads'
 
@@ -105,10 +108,13 @@ async def get_messages(chat_name: str, limit: int = 0):
 
 @app.post("/api/login")
 async def login(req: LoginRequest):
-    global client
+    global client, global_api_id, global_api_hash
     try:
         if client:
             await client.disconnect()
+
+        global_api_id = req.api_id
+        global_api_hash = req.api_hash
         
         client = TelegramClient(SESSION_NAME, req.api_id, req.api_hash,
                                 connection_retries=None,
@@ -194,88 +200,100 @@ async def fast_download(client, message, filepath):
             _bytes_downloaded_total += message.file.size if message.file else 0
         return
 
-    # Use low-level download_file with 2048KB (2MB) chunks — Telethon's usable max.
-    # Larger chunks = fewer round-trips = dramatically faster on fast connections.
+    # Use low-level download_file with 512KB chunks (Telethon's hard limit).
     await client.download_file(
         message.document or message.photo or message.video or message.audio or message.voice,
         file=filepath,
-        part_size_kb=2048
+        part_size_kb=512
     )
     async with _bytes_lock:
         _bytes_downloaded_total += message.file.size if message.file else 0
 
-async def download_worker(queue, chat_dir):
+def get_session_string(session):
+    string_session = StringSession()
+    string_session.set_dc(session.dc_id, session.server_address, session.port)
+    string_session.auth_key = session.auth_key
+    return string_session.save()
+
+async def download_worker(queue, chat_dir, session_string, api_id, api_hash):
     """High-speed download worker — handles global flood-wait pauses."""
     global client, download_status, terminal_progress, flood_lock
     from telethon.errors import FloodWaitError
-    while True:
-        try:
-            # Wait if a global flood-wait pause is active
-            if not flood_lock.is_set():
-                await flood_lock.wait()
 
-            message = await queue.get()
-            media_type = await get_media_type(message)
-            type_dir = os.path.join(chat_dir, media_type)
-            os.makedirs(type_dir, exist_ok=True)
+    worker_client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+    await worker_client.connect()
 
-            filename = await get_file_name(message)
-            filename = "".join([c for c in filename if c.isalnum() or c in ' ._-()']).rstrip()
-            if not filename:
-                filename = f"file_{message.id}.unknown"
-
-            filepath = os.path.join(type_dir, filename)
-            message._export_path = os.path.join(media_type, filename)
-
+    try:
+        while True:
             try:
-                part_path = filepath + ".part"
-                try:
-                    await fast_download(client, message, part_path)
-                except FileReferenceExpiredError:
-                    logger.warning(f"File reference expired for {filename} — re-fetching...")
-                    message = await refresh_message(message)
-                    await fast_download(client, message, part_path)
-                
-                if os.path.exists(part_path):
-                    os.rename(part_path, filepath)
-            except FloodWaitError as e:
-                # If we hit a flood wait, pause ALL workers
-                if flood_lock.is_set():
-                    flood_lock.clear()
-                    logger.warning(f"FloodWait: Hitting rate limits. Pausing all workers for {e.seconds}s")
-                    
-                    # Update status for all to see
-                    orig_msg = download_status["message"]
-                    download_status["message"] = f"⏳ Rate Limited: Pausing {e.seconds}s..."
-                    
-                    await asyncio.sleep(e.seconds)
-                    
-                    download_status["message"] = orig_msg
-                    flood_lock.set()
-                else:
-                    # Another worker already triggered the pause, just wait for it
+                # Wait if a global flood-wait pause is active
+                if not flood_lock.is_set():
                     await flood_lock.wait()
-                    # Re-queue the message to try again
-                    queue.put_nowait(message)
-                    queue.task_done()
-                    continue
-            except Exception as e:
-                logger.error(f"Error downloading {filename}: {e}")
-                if os.path.exists(filepath + ".part"):
-                    try:
-                        os.remove(filepath + ".part")
-                    except:
-                        pass
 
-            download_status["current"] += 1
-            if terminal_progress:
-                terminal_progress.update(1)
-            queue.task_done()
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Worker error: {e}")
-            queue.task_done()
+                message = await queue.get()
+                media_type = await get_media_type(message)
+                type_dir = os.path.join(chat_dir, media_type)
+                os.makedirs(type_dir, exist_ok=True)
+
+                filename = await get_file_name(message)
+                filename = "".join([c for c in filename if c.isalnum() or c in ' ._-()']).rstrip()
+                if not filename:
+                    filename = f"file_{message.id}.unknown"
+
+                filepath = os.path.join(type_dir, filename)
+                message._export_path = os.path.join(media_type, filename)
+
+                try:
+                    part_path = filepath + ".part"
+                    try:
+                        await fast_download(worker_client, message, part_path)
+                    except FileReferenceExpiredError:
+                        logger.warning(f"File reference expired for {filename} — re-fetching...")
+                        message = await refresh_message(message)
+                        await fast_download(worker_client, message, part_path)
+                    
+                    if os.path.exists(part_path):
+                        os.rename(part_path, filepath)
+                except FloodWaitError as e:
+                    # If we hit a flood wait, pause ALL workers
+                    if flood_lock.is_set():
+                        flood_lock.clear()
+                        logger.warning(f"FloodWait: Hitting rate limits. Pausing all workers for {e.seconds}s")
+
+                        # Update status for all to see
+                        orig_msg = download_status["message"]
+                        download_status["message"] = f"⏳ Rate Limited: Pausing {e.seconds}s..."
+
+                        await asyncio.sleep(e.seconds)
+
+                        download_status["message"] = orig_msg
+                        flood_lock.set()
+                    else:
+                        # Another worker already triggered the pause, just wait for it
+                        await flood_lock.wait()
+                        # Re-queue the message to try again
+                        queue.put_nowait(message)
+                        queue.task_done()
+                        continue
+                except Exception as e:
+                    logger.error(f"Error downloading {filename}: {e}")
+                    if os.path.exists(filepath + ".part"):
+                        try:
+                            os.remove(filepath + ".part")
+                        except:
+                            pass
+
+                download_status["current"] += 1
+                if terminal_progress:
+                    terminal_progress.update(1)
+                queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Worker error: {e}")
+                queue.task_done()
+    finally:
+        await worker_client.disconnect()
 
 @app.post("/api/start_download")
 async def start_download(req: DownloadRequest):
@@ -417,7 +435,7 @@ async def _speed_tracker():
         download_status["speed_mbps"] = round(delta / 1_048_576, 2)  # bytes → MB/s
 
 async def run_download_process(entity, concurrent_downloads, chat_dir, selected_ids=None):
-    global client, download_status, _bytes_downloaded_total
+    global client, download_status, _bytes_downloaded_total, global_api_id, global_api_hash
     try:
         all_messages = []
         messages_to_download = []
@@ -488,8 +506,9 @@ async def run_download_process(entity, concurrent_downloads, chat_dir, selected_
                 speed_task = asyncio.create_task(_speed_tracker())
 
                 # Phase 3: Unleash all workers simultaneously
+                session_string = get_session_string(client.session)
                 workers = [
-                    asyncio.create_task(download_worker(queue, chat_dir))
+                    asyncio.create_task(download_worker(queue, chat_dir, session_string, global_api_id, global_api_hash))
                     for _ in range(concurrent_downloads)
                 ]
 

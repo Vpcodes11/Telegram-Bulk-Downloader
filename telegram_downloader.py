@@ -4,6 +4,7 @@ import asyncio
 import logging
 import random
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError, SessionPasswordNeededError, FileReferenceExpiredError
 from tqdm import tqdm
 
@@ -69,150 +70,162 @@ def interleave_by_size(messages):
         if i < len(large): result.append(large[i])
     return result
 
-async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
+def get_session_string(session):
+    string_session = StringSession()
+    string_session.set_dc(session.dc_id, session.server_address, session.port)
+    string_session.auth_key = session.auth_key
+    return string_session.save()
+
+async def download_worker(worker_id, queue, main_client, session_string, api_id, api_hash, chat_dir, pbar, done_event):
     global flood_lock, is_paused, _bytes_downloaded
     retries = {}
-    while True:
-        try:
+    worker_client = TelegramClient(StringSession(session_string), int(api_id), api_hash)
+    await worker_client.connect()
+
+    try:
+        while True:
             try:
-                message = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                if done_event.is_set():
-                    return
-                await asyncio.sleep(0.1)
-                continue
-
-            if not flood_lock.is_set():
-                await flood_lock.wait()
-
-            try:
-                m_type = await get_media_type(message)
-                type_dir = os.path.join(chat_dir, m_type)
-                os.makedirs(type_dir, exist_ok=True)
-
-                orig_name = await get_file_name(message)
-                clean_name = "".join([c for c in orig_name if c.isalnum() or c in ' ._-()']).rstrip()
-                if not clean_name: clean_name = "file.unknown"
-
-                unique_filename = f"{message.id}_{clean_name}"
-                unique_filepath = os.path.join(type_dir, unique_filename)
-                legacy_filepath = os.path.join(type_dir, clean_name)
-
-                file_size = (message.file.size or 0) if getattr(message, 'file', None) else 0
-                timeout = get_timeout(file_size)
-
-                # Deduplication & Migration
-                if os.path.exists(unique_filepath) and os.path.getsize(unique_filepath) == file_size:
-                    pbar.update(1)
-                    continue
-
-                if os.path.exists(legacy_filepath) and os.path.getsize(legacy_filepath) == file_size:
-                    try:
-                        os.rename(legacy_filepath, unique_filepath)
-                        pbar.update(1)
-                        continue
-                    except: pass
-
-                # Download using download_file with 512KB chunks for stability, fallback to download_media
-                last_received = 0
-                def make_progress_cb():
-                    nonlocal last_received
-                    def cb(received, total):
-                        nonlocal last_received
-                        global _bytes_downloaded
-                        delta = received - last_received
-                        if delta > 0:
-                            _bytes_downloaded += delta
-                            last_received = delta + last_received
-                    return cb
-
-                part_filepath = unique_filepath + '.part'
-                
                 try:
-                    media_input = getattr(message, 'document', None) or getattr(message, 'photo', None) or getattr(message, 'video', None) or getattr(message, 'audio', None) or getattr(message, 'voice', None)
-                    if media_input:
-                        await asyncio.wait_for(
-                            client.download_file(
-                                media_input,
-                                file=part_filepath,
-                                part_size_kb=512,
-                                progress_callback=make_progress_cb()
-                            ),
-                            timeout=timeout
-                        )
-                    else:
-                        await asyncio.wait_for(
-                            client.download_media(
-                                message, 
-                                file=part_filepath,
-                                progress_callback=make_progress_cb()
-                            ),
-                            timeout=timeout
-                        )
-                    
-                    # Success! Rename to final file to prevent 0-byte ghost files
-                    if os.path.exists(part_filepath):
-                        if os.path.exists(unique_filepath):
-                            try: os.remove(unique_filepath)
-                            except: pass
-                        os.rename(part_filepath, unique_filepath)
-                        
-                except FloodWaitError as e:
-                    if flood_lock.is_set():
-                        flood_lock.clear()
-                        is_paused = True
-                        for remaining in range(e.seconds, 0, -1):
-                            pbar.set_postfix_str(f"PAUSED {remaining}s")
-                            await asyncio.sleep(1)
-                        is_paused = False
-                        flood_lock.set()
-                    queue.put_nowait(message)
+                    message = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    if done_event.is_set():
+                        return
+                    await asyncio.sleep(0.1)
                     continue
-                except FileReferenceExpiredError:
-                    rid = message.id
-                    retries[rid] = retries.get(rid, 0) + 1
-                    if retries[rid] <= MAX_RETRIES:
-                        message = await refresh_message(client, message)
-                        queue.put_nowait(message)
-                        continue
-                    else:
-                        logger.warning(f"Skipped (expired): {unique_filename}")
+
+                if not flood_lock.is_set():
+                    await flood_lock.wait()
+
+                try:
+                    m_type = await get_media_type(message)
+                    type_dir = os.path.join(chat_dir, m_type)
+                    os.makedirs(type_dir, exist_ok=True)
+
+                    orig_name = await get_file_name(message)
+                    clean_name = "".join([c for c in orig_name if c.isalnum() or c in ' ._-()']).rstrip()
+                    if not clean_name: clean_name = "file.unknown"
+
+                    unique_filename = f"{message.id}_{clean_name}"
+                    unique_filepath = os.path.join(type_dir, unique_filename)
+                    legacy_filepath = os.path.join(type_dir, clean_name)
+
+                    file_size = (message.file.size or 0) if getattr(message, 'file', None) else 0
+                    timeout = get_timeout(file_size)
+
+                    # Deduplication & Migration
+                    if os.path.exists(unique_filepath) and os.path.getsize(unique_filepath) == file_size:
                         pbar.update(1)
-                except asyncio.TimeoutError:
-                    rid = message.id
-                    retries[rid] = retries.get(rid, 0) + 1
-                    if retries[rid] <= MAX_RETRIES:
-                        logger.warning(f"Timeout ({int(timeout)}s): {unique_filename} retry {retries[rid]}/{MAX_RETRIES}")
-                        # Clean up partial file
-                        if os.path.exists(unique_filepath):
-                            try: os.remove(unique_filepath)
-                            except: pass
-                        queue.put_nowait(message)
                         continue
-                    else:
-                        logger.warning(f"Skipped (timeout): {unique_filename}")
-                        if os.path.exists(unique_filepath):
-                            try: os.remove(unique_filepath)
-                            except: pass
-                        pbar.update(1)
-                except Exception as e:
-                    logger.error(f"Error {unique_filename}: {e}")
-                    if "disconnected" in str(e).lower():
-                        if not client.is_connected():
-                            logger.warning("Client disconnected. Reconnecting...")
-                            try: await client.connect()
-                            except: pass
-                    if os.path.exists(part_filepath):
-                        try: os.remove(part_filepath)
+
+                    if os.path.exists(legacy_filepath) and os.path.getsize(legacy_filepath) == file_size:
+                        try:
+                            os.rename(legacy_filepath, unique_filepath)
+                            pbar.update(1)
+                            continue
                         except: pass
-                
-                pbar.update(1)
+
+                    # Download using download_file with 512KB chunks for stability, fallback to download_media
+                    last_received = 0
+                    def make_progress_cb():
+                        nonlocal last_received
+                        def cb(received, total):
+                            nonlocal last_received
+                            global _bytes_downloaded
+                            delta = received - last_received
+                            if delta > 0:
+                                _bytes_downloaded += delta
+                                last_received = delta + last_received
+                        return cb
+
+                    part_filepath = unique_filepath + '.part'
+                    
+                    try:
+                        media_input = getattr(message, 'document', None) or getattr(message, 'photo', None) or getattr(message, 'video', None) or getattr(message, 'audio', None) or getattr(message, 'voice', None)
+                        if media_input:
+                            await asyncio.wait_for(
+                                worker_client.download_file(
+                                    media_input,
+                                    file=part_filepath,
+                                    part_size_kb=512,
+                                    progress_callback=make_progress_cb()
+                                ),
+                                timeout=timeout
+                            )
+                        else:
+                            await asyncio.wait_for(
+                                worker_client.download_media(
+                                    message,
+                                    file=part_filepath,
+                                    progress_callback=make_progress_cb()
+                                ),
+                                timeout=timeout
+                            )
+                        
+                        # Success! Rename to final file to prevent 0-byte ghost files
+                        if os.path.exists(part_filepath):
+                            if os.path.exists(unique_filepath):
+                                try: os.remove(unique_filepath)
+                                except: pass
+                            os.rename(part_filepath, unique_filepath)
+
+                    except FloodWaitError as e:
+                        if flood_lock.is_set():
+                            flood_lock.clear()
+                            is_paused = True
+                            for remaining in range(e.seconds, 0, -1):
+                                pbar.set_postfix_str(f"PAUSED {remaining}s")
+                                await asyncio.sleep(1)
+                            is_paused = False
+                            flood_lock.set()
+                        queue.put_nowait(message)
+                        continue
+                    except FileReferenceExpiredError:
+                        rid = message.id
+                        retries[rid] = retries.get(rid, 0) + 1
+                        if retries[rid] <= MAX_RETRIES:
+                            message = await refresh_message(main_client, message)
+                            queue.put_nowait(message)
+                            continue
+                        else:
+                            logger.warning(f"Skipped (expired): {unique_filename}")
+                            pbar.update(1)
+                    except asyncio.TimeoutError:
+                        rid = message.id
+                        retries[rid] = retries.get(rid, 0) + 1
+                        if retries[rid] <= MAX_RETRIES:
+                            logger.warning(f"Timeout ({int(timeout)}s): {unique_filename} retry {retries[rid]}/{MAX_RETRIES}")
+                            # Clean up partial file
+                            if os.path.exists(unique_filepath):
+                                try: os.remove(unique_filepath)
+                                except: pass
+                            queue.put_nowait(message)
+                            continue
+                        else:
+                            logger.warning(f"Skipped (timeout): {unique_filename}")
+                            if os.path.exists(unique_filepath):
+                                try: os.remove(unique_filepath)
+                                except: pass
+                            pbar.update(1)
+                    except Exception as e:
+                        logger.error(f"Error {unique_filename}: {e}")
+                        if "disconnected" in str(e).lower():
+                            if not worker_client.is_connected():
+                                logger.warning("Client disconnected. Reconnecting...")
+                                try: await worker_client.connect()
+                                except: pass
+                        if os.path.exists(part_filepath):
+                            try: os.remove(part_filepath)
+                            except: pass
+
+                    pbar.update(1)
+                except Exception as e:
+                    logger.error(f"Worker {worker_id} error: {e}")
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Worker {worker_id} error: {e}")
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.error(f"Worker {worker_id} crash: {e}")
+                logger.error(f"Worker {worker_id} crash: {e}")
+    finally:
+        await worker_client.disconnect()
 
 async def main():
     global _bytes_downloaded
@@ -280,8 +293,9 @@ async def main():
 
         pbar = tqdm(total=total_media, desc=f"DL {chat_title}", unit="file", leave=True)
 
+        session_string = get_session_string(client.session)
         workers = [
-            asyncio.create_task(download_worker(i, queue, client, chat_dir, pbar, done_event))
+            asyncio.create_task(download_worker(i, queue, client, session_string, API_ID, API_HASH, chat_dir, pbar, done_event))
             for i in range(CONCURRENT_DOWNLOADS)
         ]
 
