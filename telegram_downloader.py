@@ -29,10 +29,10 @@ _bytes_downloaded = 0
 is_paused = False
 
 def get_timeout(file_size):
-    """Dynamic timeout: 60s base + 30s per 10MB. Minimum 60s, Maximum 1800s."""
-    if not file_size: return 120
-    extra = (file_size / (10 * 1024 * 1024)) * 30
-    return min(max(60, 60 + extra), 1800)
+    """Dynamic timeout: 300s base (5 min) + 60s per 10MB. Minimum 300s, Maximum 3600s (1 hour)."""
+    if not file_size: return 300
+    extra = (file_size / (10 * 1024 * 1024)) * 60
+    return min(max(300, 300 + extra), 3600)
 
 async def get_file_name(message):
     if message.file and hasattr(message.file, 'name') and message.file.name:
