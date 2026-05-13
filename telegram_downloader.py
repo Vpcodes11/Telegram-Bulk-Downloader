@@ -113,13 +113,40 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                         continue
                     except: pass
 
-                # Download using download_media (most reliable)
+                # Download using download_file with 512KB chunks for stability, fallback to download_media
+                last_received = 0
+                def make_progress_cb():
+                    nonlocal last_received
+                    def cb(received, total):
+                        nonlocal last_received
+                        global _bytes_downloaded
+                        delta = received - last_received
+                        if delta > 0:
+                            _bytes_downloaded += delta
+                            last_received = delta + last_received
+                    return cb
+
                 try:
-                    await asyncio.wait_for(
-                        client.download_media(message, file=unique_filepath),
-                        timeout=timeout
-                    )
-                    _bytes_downloaded += file_size
+                    media_input = getattr(message, 'document', None) or getattr(message, 'photo', None) or getattr(message, 'video', None) or getattr(message, 'audio', None) or getattr(message, 'voice', None)
+                    if media_input:
+                        await asyncio.wait_for(
+                            client.download_file(
+                                media_input,
+                                file=unique_filepath,
+                                part_size_kb=512,
+                                progress_callback=make_progress_cb()
+                            ),
+                            timeout=timeout
+                        )
+                    else:
+                        await asyncio.wait_for(
+                            client.download_media(
+                                message, 
+                                file=unique_filepath,
+                                progress_callback=make_progress_cb()
+                            ),
+                            timeout=timeout
+                        )
                 except FloodWaitError as e:
                     if flood_lock.is_set():
                         flood_lock.clear()
