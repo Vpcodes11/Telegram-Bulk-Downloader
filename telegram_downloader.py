@@ -246,7 +246,8 @@ async def main():
             print("No media found.")
             continue
 
-        # ── PHASE 2: INTERLEAVE ──
+        # ── PHASE 2: INTERLEAVE & MULTI-CLIENT SETUP ──
+        print("Phase 2: Preparing true parallel connections...")
         media_messages = interleave_by_size(media_messages)
 
         queue = asyncio.Queue()
@@ -257,12 +258,20 @@ async def main():
 
         done_event.set()
 
-        print(f"Phase 2: Downloading {total_media} files with {CONCURRENT_DOWNLOADS} workers...\n")
+        from telethon.sessions import StringSession
+        session_str = client.session.save()
+        worker_clients = []
+        for i in range(CONCURRENT_DOWNLOADS):
+            wc = TelegramClient(StringSession(session_str), int(API_ID), API_HASH)
+            await wc.connect()
+            worker_clients.append(wc)
+
+        print(f"Phase 3: Downloading {total_media} files with {CONCURRENT_DOWNLOADS} independent connections...\n")
 
         pbar = tqdm(total=total_media, desc=f"DL {chat_title}", unit="file", leave=True)
 
         workers = [
-            asyncio.create_task(download_worker(i, queue, client, chat_dir, pbar, done_event))
+            asyncio.create_task(download_worker(i, queue, worker_clients[i], chat_dir, pbar, done_event))
             for i in range(CONCURRENT_DOWNLOADS)
         ]
 
@@ -284,6 +293,9 @@ async def main():
 
         speed_task.cancel()
         pbar.close()
+
+        for wc in worker_clients:
+            await wc.disconnect()
 
         # Count actual files
         actual_files = sum(len(files) for _, _, files in os.walk(chat_dir))
