@@ -208,80 +208,89 @@ async def main():
     client.flood_sleep_threshold = 24 * 60 * 60
     await client.start(phone=PHONE_NUMBER)
 
-    chat_input = input("\nEnter @channelname or link: ").strip()
-    try:
-        entity = await client.get_entity(chat_input)
-    except Exception as e:
-        print(f"Error: {e}")
-        return
-
-    chat_title = "".join([c for c in getattr(entity, 'title', 'chat') if c.isalnum() or c in ' ._-']).strip()
-    chat_dir = os.path.join(DOWNLOAD_DIR, chat_title)
-    os.makedirs(chat_dir, exist_ok=True)
-
-    print(f"\nTarget: {chat_title}")
-
-    # ── PHASE 1: SCAN ──
-    print("Phase 1: Scanning channel...")
-    media_messages = []
-    msg_count = 0
-    async for msg in client.iter_messages(entity):
-        msg_count += 1
-        if msg.media:
-            media_messages.append(msg)
-        if msg_count % 500 == 0:
-            print(f"  Scanned {msg_count} messages, found {len(media_messages)} media...")
-
-    total_media = len(media_messages)
-    print(f"  Scan complete: {msg_count} messages, {total_media} media files.\n")
-
-    if total_media == 0:
-        print("No media found.")
+    chat_input = input("\nEnter @channelname or link (comma-separated for multiple): ").strip()
+    
+    chats = [c.strip() for c in chat_input.split(',') if c.strip()]
+    if not chats:
         await client.disconnect()
         return
 
-    # ── PHASE 2: INTERLEAVE ──
-    media_messages = interleave_by_size(media_messages)
+    for chat in chats:
+        try:
+            entity = await client.get_entity(chat)
+        except Exception as e:
+            print(f"\nError accessing {chat}: {e}")
+            continue
 
-    queue = asyncio.Queue()
-    done_event = asyncio.Event()
+        chat_title = "".join([c for c in getattr(entity, 'title', 'chat') if c.isalnum() or c in ' ._-']).strip()
+        chat_dir = os.path.join(DOWNLOAD_DIR, chat_title)
+        os.makedirs(chat_dir, exist_ok=True)
 
-    for m in media_messages:
-        queue.put_nowait(m)
+        print(f"\nTarget: {chat_title}")
 
-    done_event.set()
+        # ── PHASE 1: SCAN ──
+        print("Phase 1: Scanning channel...")
+        media_messages = []
+        msg_count = 0
+        async for msg in client.iter_messages(entity):
+            msg_count += 1
+            if msg.media:
+                media_messages.append(msg)
+            if msg_count % 500 == 0:
+                print(f"  Scanned {msg_count} messages, found {len(media_messages)} media...")
 
-    print(f"Phase 2: Downloading {total_media} files with {CONCURRENT_DOWNLOADS} workers...\n")
+        total_media = len(media_messages)
+        print(f"  Scan complete: {msg_count} messages, {total_media} media files.\n")
 
-    pbar = tqdm(total=total_media, desc="DOWNLOADING", unit="file", leave=True)
+        if total_media == 0:
+            print("No media found.")
+            continue
 
-    workers = [
-        asyncio.create_task(download_worker(i, queue, client, chat_dir, pbar, done_event))
-        for i in range(CONCURRENT_DOWNLOADS)
-    ]
+        # ── PHASE 2: INTERLEAVE ──
+        media_messages = interleave_by_size(media_messages)
 
-    # Speed monitor
-    async def monitor_speed():
-        global _bytes_downloaded, is_paused
-        prev = 0
-        while True:
-            await asyncio.sleep(1)
-            curr = _bytes_downloaded
-            mbps = (curr - prev) / (1024 * 1024)
-            prev = curr
-            if not is_paused:
-                pbar.set_postfix_str(f"{mbps:.1f} MB/s")
+        queue = asyncio.Queue()
+        done_event = asyncio.Event()
 
-    speed_task = asyncio.create_task(monitor_speed())
+        for m in media_messages:
+            queue.put_nowait(m)
 
-    await asyncio.gather(*workers)
+        done_event.set()
 
-    speed_task.cancel()
-    pbar.close()
+        print(f"Phase 2: Downloading {total_media} files with {CONCURRENT_DOWNLOADS} workers...\n")
 
-    # Count actual files
-    actual_files = sum(len(files) for _, _, files in os.walk(chat_dir))
-    print(f"\nAll done! {actual_files} files in {os.path.abspath(chat_dir)}")
+        pbar = tqdm(total=total_media, desc=f"DL {chat_title}", unit="file", leave=True)
+
+        workers = [
+            asyncio.create_task(download_worker(i, queue, client, chat_dir, pbar, done_event))
+            for i in range(CONCURRENT_DOWNLOADS)
+        ]
+
+        # Speed monitor
+        async def monitor_speed(pbar_ref):
+            global _bytes_downloaded, is_paused
+            prev = 0
+            while True:
+                await asyncio.sleep(1)
+                curr = _bytes_downloaded
+                mbps = (curr - prev) / (1024 * 1024)
+                prev = curr
+                if not is_paused:
+                    pbar_ref.set_postfix_str(f"{mbps:.1f} MB/s")
+
+        speed_task = asyncio.create_task(monitor_speed(pbar))
+
+        await asyncio.gather(*workers)
+
+        speed_task.cancel()
+        pbar.close()
+
+        # Count actual files
+        actual_files = sum(len(files) for _, _, files in os.walk(chat_dir))
+        print(f"\nAll done for {chat_title}! {actual_files} files in {os.path.abspath(chat_dir)}\n")
+        print("-" * 50)
+
+    print("All requested channels have been processed.")
     await client.disconnect()
 
 if __name__ == '__main__':
