@@ -58,7 +58,7 @@ async def refresh_message(client, message):
 
 def interleave_by_size(messages):
     """Interleave large and small files so workers stay busy throughout."""
-    sized = [(m.file.size if m.file else 0, m) for m in messages]
+    sized = [((m.file.size or 0) if getattr(m, 'file', None) else 0, m) for m in messages]
     sized.sort(key=lambda x: x[0])
     half = len(sized) // 2
     small = [m for _, m in sized[:half]]
@@ -98,7 +98,7 @@ async def download_worker(worker_id, queue, client, chat_dir, pbar, done_event):
                 unique_filepath = os.path.join(type_dir, unique_filename)
                 legacy_filepath = os.path.join(type_dir, clean_name)
 
-                file_size = message.file.size if message.file else 0
+                file_size = (message.file.size or 0) if getattr(message, 'file', None) else 0
                 timeout = get_timeout(file_size)
 
                 # Deduplication & Migration
