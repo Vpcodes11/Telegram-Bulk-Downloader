@@ -36,10 +36,14 @@ async def get_file_name(message):
 
 async def get_media_type(message):
     if message.photo: return 'photos'
-    elif message.video: return 'videos'
+    elif message.video:
+        if message.video.attributes and any(isinstance(a, type(message.video.attributes[0])) and hasattr(a, 'round_message') and a.round_message for a in message.video.attributes):
+            return 'round_video'
+        return 'videos'
     elif message.voice: return 'voice'
     elif message.audio: return 'audio'
     elif message.document: return 'files'
+    elif hasattr(message, 'gif') and message.gif: return 'gifs'
     else: return 'other'
 
 async def refresh_message(client, message):
